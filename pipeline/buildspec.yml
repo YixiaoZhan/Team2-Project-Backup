@@ -1,0 +1,75 @@
+version: 0.2
+
+env:
+  secrets-manager:
+    DOCKERHUB_USERNAME: "DockerHubSecret:username"
+    DOCKERHUB_PASS: "DockerHubSecret:password"
+phases:
+  install:
+    runtime-versions:
+      python: 3.8
+    commands:
+      - echo "Entered the install phase..."
+      - apt-get update -y
+      - npm install snyk@latest -g 
+      - npm install -g aws-cdk
+      - pip install -r ./pipeline/requirements.txt
+      # Clone CF -> Threagile bridge code and install requirements
+      - git clone https://github.com/dsvid/cloudformation-threagile-bridge
+      - pip install -r ./cloudformation-threagile-bridge/requirements.txt
+      # Clone Docker image code and install requirements
+      - git clone https://github.com/JrdnVan/comp9447-docker-image
+      - git clone https://github.com/JrdnVan/comp9447-ecs
+      - pip install -r ./comp9447-ecs/MyEcsConstruct/requirements.txt
+      - pip install aws_cdk.aws_ec2 aws_cdk.aws_ecs aws_cdk.aws_ecs_patterns
+      - pip install virtualenv
+      - echo "Finished the install phase..."
+  pre_build:
+    commands:
+      - echo "Entered the pre-build phase..."
+      - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASS
+      - docker pull threagile/threagile
+      - snyk config set api=xxxxx 
+      # Create output directory for cloud formation <-> Threagile translation
+      - mkdir cf-threagile-bridge-output
+      - chmod 777 cf-threagile-bridge-output
+      - echo "Finished the pre-build phase..."
+  build:
+    commands:
+      - echo "Entered the build phase..."
+      # Run snyk test on the app
+      - snyk test ./app/sample_app --json-file-output=snyk_output.json || true
+      # Create and deploy docker image to AWS ECR
+      - cd comp9447-docker-image
+      - docker build -t threagile-docker-image .
+      - aws ecr create-repository --repository-name threagile-docker-image-store || true
+      - aws ecr get-login-password --region ap-southeast-2 | docker login --username xxxxx --password-stdin xxxxx  
+      - docker tag threagile-docker-image 763449422086.dkr.ecr.ap-southeast-2.amazonaws.com/threagile-docker-image-store
+      - docker push 763449422086.dkr.ecr.ap-southeast-2.amazonaws.com/threagile-docker-image-store
+      - cd ..
+      # Create a Fargate instance with the docker iamge stored in ECR and getting the CloudFOrmation template
+      - cd comp9447-ecs/MyEcsConstruct
+      - cdk synth > cfn.yaml
+      - cd ../../
+      # cloud formation <-> Threagile translation
+      - cd cloudformation-threagile-bridge
+      - python main.py "../comp9447-ecs/MyEcsConstruct/cfn.yaml" "../app/threagile-stub-kashout.yaml" "../cf-threagile-bridge-output/translated_output.yaml"
+      - cd ..
+      # Run threagile on the app cloud formation template
+      - docker run --rm --privileged -v "$(pwd)"/cf-threagile-bridge-output:/app/work:rw threagile/threagile -verbose -model /app/work/translated_output.yaml -output /app/work
+      - mv ./cf-threagile-bridge-output/report.pdf Threagile_Report.pdf
+      - echo "Finished the build phase..."
+  post_build:
+    commands:
+      - echo "Entered the post build phase..."
+      # Generate the report from snyk output and threagile output
+      - python ./pipeline/parse_threagile_and_snyk_outputs.py snyk_output.json ./cf-threagile-bridge-output/risks.xlsx
+      - echo "Finished the post build phase..."
+
+artifacts:
+  files:
+    - Findings_Summary.pdf
+    - Threagile_Report.pdf
+    - ./cf-threagile-bridge-output/risks.xlsx
+    - ./cf-threagile-bridge-output/data-flow-diagram.png
+    - ./cloudformation-threagile-bridge/cf-threagile-bridge-report.txt

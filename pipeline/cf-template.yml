@@ -1,0 +1,514 @@
+Parameters:
+  SecretsManagerReadwrite:
+    Type: String
+    Default: 'arn:aws:iam::aws:policy/SecretsManagerReadWrite'
+  AmazonS3ReadOnly:
+    Type: String
+    Default: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+
+Resources:
+  AppPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      RoleArn: !GetAtt 
+        - PipelineServiceRole
+        - Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                BranchName: master
+                RepositoryName: sample_customer_project
+                PollForSourceChanges: true
+              RunOrder: 1
+        
+        - Name: Build
+          Actions:
+            - Name: Build
+              InputArtifacts:
+                - Name: SourceArtifact
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              OutputArtifacts: 
+                - Name: ThreatModelArtifacts
+              Configuration:
+                ProjectName: !Ref ThreatModelBuildProject
+              RunOrder: 2
+        
+        - Name: SecurityHub
+          Actions:
+            - Name: SecurityHub
+              InputArtifacts:
+                - Name: ThreatModelArtifacts
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: '1'
+                Provider: Lambda
+              OutputArtifacts: []
+              Configuration:
+                FunctionName: SecHub
+              RunOrder: 3
+
+        - Name: SlackBot
+          Actions:
+            - Name: SlackBot
+              InputArtifacts:
+                - Name: ThreatModelArtifacts
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: '1'
+                Provider: Lambda
+              OutputArtifacts: []
+              Configuration:
+                FunctionName: Slack-Chatbot
+              RunOrder: 4
+
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+      Tags:
+        - Key: pipeline-name
+          Value: !Sub ${AWS::StackName}-pipeline
+
+  LambdaSlackIntegration:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Slack-Chatbot
+      Role: !GetAtt 
+        - LambdaRole
+        - Arn
+      Runtime: python3.7
+      Timeout: 20
+      Handler: index.lambda_handler
+      Code: 
+        ZipFile: |
+          import json
+          import requests
+          import urllib.parse
+          import boto3
+          import urllib3
+          import datetime
+          import gzip
+          from zipfile import ZipFile
+          from io import BytesIO
+          from botocore.exceptions import ClientError
+
+          http = urllib3.PoolManager()
+
+          # Slack Params
+          SLACKBOT_TOKEN = ''
+          SLACK_CHANNELID = ''
+          SLACK_UPLOAD = "https://slack.com/api/files.upload"
+          SLACK_POST = "https://slack.com/api/chat.postMessage"
+
+          s3 = boto3.client('s3')
+          codecommit = boto3.client('codecommit')
+          cf = boto3.client('cloudformation')
+          code_pipeline = boto3.client('codepipeline')
+
+          def get_secret():
+              global SLACKBOT_TOKEN
+              global SLACK_CHANNELID
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+              )
+              try:
+                  get_secret_value_response = client.get_secret_value(SecretId='SlackSecret')
+                  secrets = json.loads(get_secret_value_response['SecretString'])
+                  SLACKBOT_TOKEN = secrets['slackbot-token']
+                  SLACK_CHANNELID = secrets['channel-id']
+              except ClientError as e:
+                  print(e)
+              
+              
+          def put_job_success(job, message):
+              print('Putting job success')
+              print(message)
+              code_pipeline.put_job_success_result(jobId=job)
+            
+          def put_job_failure(job, message):
+              print('Putting job failure')
+              print(message)
+              code_pipeline.put_job_failure_result(jobId=job, failureDetails={'message': message, 'type': 'JobFailed'})
+              
+          def upload2slack(filename, content, format, comment):
+              my_file = {
+                  'file' : (filename, content, format)
+              }
+              
+              payload = {
+                "filename": filename, 
+                "channels": SLACK_CHANNELID,
+                "initial_comment": comment
+              }
+              
+              headers = {'Authorization': 'Bearer ' + SLACKBOT_TOKEN}
+              response = requests.post(SLACK_UPLOAD, params=payload, headers=headers, files=my_file)
+
+          def send2slack(text): 
+              payload = {
+                  "text": text, 
+                  "channel": SLACK_CHANNELID,
+              }
+              
+              headers = {'Authorization': 'Bearer ' + SLACKBOT_TOKEN}
+              response = requests.post(SLACK_POST, params=payload, headers=headers)
+
+          def s3_handler(artifacts):
+              bucket = artifacts[0]["location"]["s3Location"]["bucketName"]
+              key = artifacts[0]["location"]["s3Location"]["objectKey"]
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  if key.split("/")[-2] == 'ThreatMode':
+                      zipped_file = ZipFile(BytesIO(response["Body"].read()))
+                      for filename in zipped_file.namelist():
+                          if filename.split('/')[-1] != 'risks.xlsx':
+                              content = zipped_file.read(filename)
+                              upload2slack(filename, content, filename.split(".")[-1] , f"Here is the autogenerated artifacts - {filename.split('/')[-1]}")
+                      
+              except Exception as e:
+                  print(e)
+
+          def lambda_handler(event, context):
+              get_secret()
+              try:
+                  job_id = event['CodePipeline.job']['id']
+                  job_data = event['CodePipeline.job']['data']
+                  artifacts = job_data['inputArtifacts']
+                  
+                  send2slack("Security Hub result can be found here: https://ap-southeast-2.console.aws.amazon.com/securityhub/home?region=ap-southeast-2#/findings")
+
+                  s3_handler(artifacts)
+                  
+                  put_job_success(job_id, 'Function succeed')
+                  
+              except Exception as e:
+                  # If any other exceptions which we didn't expect are raised
+                  # then fail the job and log the exception message.
+                  print('Function failed due to exception.') 
+                  print(e)
+                  put_job_failure(job_id, 'Function exception: ' + str(e))
+                
+              print('Function complete.')   
+              return "Complete."
+
+  LambdaSecHubIntegration:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SecHub
+      Role: !GetAtt 
+        - LambdaRole
+        - Arn
+      Runtime: python3.7
+      Timeout: 20
+      Handler: index.lambda_handler
+      Layers:
+        - arn:aws:lambda:ap-southeast-2:336392948345:layer:AWSDataWrangler-Python37:1
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import datetime
+          import gzip
+          from zipfile import ZipFile
+          from io import BytesIO
+          import os
+          import pandas as pd
+
+          http = urllib3.PoolManager()
+
+          s3 = boto3.client('s3')
+          code_pipeline = boto3.client('codepipeline')
+          security_hub = boto3.client('securityhub')
+
+          def put_job_success(job, message):
+              print('Putting job success')
+              code_pipeline.put_job_success_result(jobId=job)
+            
+          def put_job_failure(job, message):
+              print('Putting job failure')
+              code_pipeline.put_job_failure_result(jobId=job, failureDetails={'message': message, 'type': 'JobFailed'})
+
+          def import_finding_to_sechub(findings):
+              print('Importing finding to security hub')
+              
+              region: str = os.environ['AWS_REGION']
+              account_id: str = boto3.client('sts').get_caller_identity().get('Account')
+              generator_id: str = "sechub"
+              build_id: str = "1"
+              
+              n = datetime.datetime.now(datetime.timezone.utc)
+              created_at = n.isoformat()
+
+              sechub_findings = []
+              for finding in findings:
+                  print(finding)
+                  
+                  sechub_findings.append({
+                      "SchemaVersion": "2018-10-08",
+                      "Id": finding['ID'],
+                      "ProductArn": "arn:aws:securityhub:{0}:{1}:product/{1}/default".format(region, account_id),
+                      "GeneratorId": generator_id,
+                      "AwsAccountId": account_id,
+                      "CreatedAt": created_at,
+                      "UpdatedAt": created_at,
+                      "Severity": {
+                          "Label": finding['Impact'].upper(),
+                      },
+                      "Title": finding['STRIDE'],
+                      "Description": finding['Identified Risk'],
+                      'Remediation': {
+                          'Recommendation': {
+                              'Text': finding['Mitigation'][:512],
+                              #'Url': best_practices_cfn
+                          }
+                      },
+                      #'SourceUrl': report_url,
+                      'Resources': [
+                          {
+                              'Id': build_id,
+                              'Type': "CodeBuild",
+                              'Partition': "aws",
+                              'Region': region
+                          }
+                      ],
+                      "Types": [
+                          "Software and Configuration Checks/AWS Security Best Practices/{0}".format(
+                              finding['Risk Category'])
+                      ],
+                  })
+
+              chunks = [sechub_findings[x:x+10] for x in range(0, len(sechub_findings), 10)]
+
+              for chunk in chunks:
+                  response = security_hub.batch_import_findings(Findings=chunk)
+                  if response['FailedCount'] > 0:
+                      print("Failed to import finding. Failed findings {}".format(response['FailedFindings']))
+
+          def s3_handler(artifacts):
+              bucket = artifacts[0]["location"]["s3Location"]["bucketName"]
+              key = artifacts[0]["location"]["s3Location"]["objectKey"]
+              
+              findings = []
+              
+              response = s3.get_object(Bucket=bucket, Key=key)
+              if key.split("/")[-2] == 'ThreatMode':
+                  zipped_file = ZipFile(BytesIO(response["Body"].read()))
+                  for filename in zipped_file.namelist():
+                      if filename == 'cf-threagile-bridge-output/risks.xlsx':
+                          content = zipped_file.read(filename)
+                          findings = pd.read_excel(content).to_dict('records')
+                          import_finding_to_sechub(findings)
+
+                          break
+                      
+          def lambda_handler(event, context):
+              job_id = event['CodePipeline.job']['id']
+              job_data = event['CodePipeline.job']['data']
+              artifacts = job_data['inputArtifacts']
+
+              try:
+                  s3_handler(artifacts)
+                  
+                  put_job_success(job_id, 'success')
+
+                  return {
+                      'statusCode': 200
+                  }
+                  
+              except Exception as e:
+                  print(e)
+                  put_job_failure(job_id, str(e))
+                  
+                  return {
+                      'statusCode': 500
+                  }
+
+  ThreatModelBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Software Composite Analysis Build Project
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+      ServiceRole: !Ref 'CodeBuildRole'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ./pipeline/buildspec.yml
+      QueuedTimeoutInMinutes: 10
+      Tags:
+        - Key: pipeline-name
+          Value: !Sub ${AWS::StackName}-pipeline 
+
+  CodePipelineArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub comp9447-21t3-threat-modelling
+      Tags:
+        - Key: pipeline-name
+          Value: !Sub ${AWS::StackName}-pipeline
+  
+  SlackSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: SlackSecret
+      Description: The secret has the token for the slack chatbot and channel id
+      SecretString: '{"slackbot-token":"xxxxx","channel-id":"xxxxx"}'
+
+  DockerHubSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: DockerHubSecret
+      Description: The secret has the username and password for DockerHub
+      SecretString: '{"username":"xxxxx","password":"xxxxx"}'
+  
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+            - Effect: Allow
+              Principal:
+                  Service:
+                    - codebuild.amazonaws.com
+              Action:
+                - sts:AssumeRole
+      Description: !Sub "IAM Role for ${AWS::StackName}"
+      Path: '/'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - codebuild:*
+                  - logs:*
+                  - '*'
+                Resource: '*'
+
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: LambdaCodePipelineExecPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobFailureResult
+                  - codepipeline:PutJobSuccessResult
+                  - securityhub:BatchImportFindings
+                  - lambda:GetLayerVersion
+                Resource: "*"
+              - Effect: Allow
+                Action: logs:*
+                Resource: arn:aws:logs:*:*:*
+      ManagedPolicyArns:
+        - !Ref SecretsManagerReadwrite
+        - !Ref AmazonS3ReadOnly
+
+  PipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-CodePipeline-Servicepolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:ListFunctions'
+                  - 'lambda:CreateFunction'
+                  - 'lambda:UpdateFunctionConfiguration'
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:TagResource'
+                  - 'lambda:PublishVersion'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:GetFunction'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:*'
+                  - 'autoscaling:*'
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                  - 'sns:*'
+                  - 'cloudformation:*'
+                  - 'rds:*'
+                  - 'sqs:*'
+                  - 'ecs:*'
+                  - 'logs:*'
+                  - 'kms:*'
+                  - 'ecr:*'
+                Resource: '*'
+
